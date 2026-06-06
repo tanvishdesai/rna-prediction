@@ -674,6 +674,24 @@ def evaluate_rmsd(
     return float(np.mean(scores)) if scores else float("inf")
 
 
+@torch.no_grad()
+def naive_baseline_rmsd(
+    loader: DataLoader,
+    mean:   np.ndarray,
+    std:    np.ndarray,
+) -> float:
+    """Constant coord_mean prediction — sanity-check floor for model RMSD."""
+    scores: List[float] = []
+    for tokens, profile, coords, mask in loader:
+        true = coords.numpy()
+        vm   = ~mask.numpy()
+        for b in range(true.shape[0]):
+            const = np.tile(mean, (true.shape[1], 1))
+            td_   = true[b] * std + mean
+            scores.append(per_sample_rmsd(const, td_, vm[b]))
+    return float(np.mean(scores)) if scores else float("inf")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # §8  Training
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -886,9 +904,13 @@ def main() -> None:
     # Reload best checkpoint and report final RMSD
     ckpt = torch.load(CFG.ckpt_path, map_location=CFG.device, weights_only=True)
     model.load_state_dict(ckpt["state"])
+    baseline_rmsd = naive_baseline_rmsd(vl_loader, tr_ds.coord_mean, tr_ds.coord_std)
     final_rmsd = evaluate_rmsd(model, vl_loader, tr_ds.coord_mean, tr_ds.coord_std, CFG.device)
     log.info("━" * 66)
-    log.info("Final validation RMSD: %.3f Å", final_rmsd)
+    log.info("Naive baseline RMSD (coord_mean): %.3f Å", baseline_rmsd)
+    log.info("Final validation RMSD:            %.3f Å", final_rmsd)
+    if final_rmsd >= baseline_rmsd:
+        log.warning("Model RMSD ≥ naive baseline — check data paths and normalisation.")
     log.info("━" * 66)
 
     # Test inference → submission.csv

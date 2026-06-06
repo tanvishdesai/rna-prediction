@@ -1,146 +1,174 @@
-"""Run FedGenome federated learning simulation (3 sites, Flower)."""
+"""Run FedGenome federated learning simulation (3 sites, manual + Flower-compatible aggregation)."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
-import torch.nn as nn
-from flwr.client import ClientApp
-from flwr.common import Context
-from flwr.server import ServerApp
-from flwr.server.strategy import FedAvg
-from flwr.simulation import run_simulation
-
-from client import FedGenomeClient, VariantDataset, get_parameters, set_parameters, train_local, _evaluate
-from model import LocalGenomeNet
-from strategy import FedGenomeStrategy
 from torch.utils.data import DataLoader, ConcatDataset
+
+from client import (
+    VariantDataset,
+    _evaluate,
+    get_parameters,
+    set_parameters,
+    train_local,
+)
+from model import LocalGenomeNet
+from strategy import _weighted_average
 
 DATA_DIR = Path(__file__).parent / "data"
 RESULTS_DIR = Path(__file__).parent / "results"
+SITES = ["site_1", "site_2", "site_3"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 64
 
 
 def load_site_records(site: str) -> list:
-    with (DATA_DIR / f"{site}.json").open() as fh:
+    with (DATA_DIR / f"{site}.json").open(encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def train_centralized() -> float:
-    """Baseline: train on all data centrally."""
-    all_records = []
-    for site in ["site_1", "site_2", "site_3"]:
-        all_records.extend(load_site_records(site))
-    model = LocalGenomeNet().to(DEVICE)
-    loader = DataLoader(VariantDataset(all_records), batch_size=64, shuffle=True)
-    _, _ = train_local(model, loader, epochs=10)
-    auc, _ = _evaluate(model, loader)
-    return auc
-
-
-def run_fl(strategy_name: str = "fedgenome", rounds: int = 10) -> dict:
-    if strategy_name == "fedgenome":
-        strategy = FedGenomeStrategy(min_fit_clients=3, min_available_clients=3)
-    else:
-        strategy = FedAvg(min_fit_clients=3, min_available_clients=3)
-
-    from client import client_fn
-    from flwr.client import ClientApp
-
-    client_app = ClientApp(client_fn=client_fn)
-
-    hist = run_simulation(
-        client_app=client_app,
-        num_clients=3,
-        num_supernodes=3,
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0},
-        backend_config={"client_resources": {"num_cpus": 1, "num_gpus": 0.0}},
+def site_loader(site: str, shuffle: bool = True) -> DataLoader:
+    return DataLoader(
+        VariantDataset(load_site_records(site)),
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
     )
-    return {"strategy": strategy_name, "rounds": rounds, "history": str(hist)}
 
 
-def evaluate_per_site(global_params=None) -> dict:
-    """Evaluate global model on each site's hold-out (uses full site data)."""
+def evaluate_all_sites(model: torch.nn.Module) -> Dict[str, Dict[str, float]]:
     results = {}
-    for site in ["site_1", "site_2", "site_3"]:
-        records = load_site_records(site)
-        model = LocalGenomeNet().to(DEVICE)
-        if global_params:
-            set_parameters(model, global_params)
-        else:
-            loader = DataLoader(VariantDataset(records), batch_size=64, shuffle=True)
-            train_local(model, loader, epochs=5)
-        loader = DataLoader(VariantDataset(records), batch_size=64)
+    for site in SITES:
+        loader = site_loader(site, shuffle=False)
         auc, prec = _evaluate(model, loader)
         results[site] = {"auc": round(auc, 4), "precision": round(prec, 4)}
     return results
 
 
+def run_centralized(epochs: int = 10) -> Dict:
+    all_records = []
+    for site in SITES:
+        all_records.extend(load_site_records(site))
+    model = LocalGenomeNet().to(DEVICE)
+    loader = DataLoader(VariantDataset(all_records), batch_size=BATCH_SIZE, shuffle=True)
+    train_local(model, loader, epochs=epochs)
+    per_site = evaluate_all_sites(model)
+    aucs = [v["auc"] for v in per_site.values()]
+    return {
+        "per_site": per_site,
+        "global_auc": round(float(np.mean(aucs)), 4),
+        "equity_gap": round(float(np.std(aucs)), 4),
+    }
+
+
+def run_federated(strategy: str, rounds: int, local_epochs: int = 2) -> Dict:
+    """
+    Simulate 3 hospital sites training a shared LocalGenomeNet.
+
+    strategy:
+      fedavg    — weight clients by dataset size
+      fedgenome — precision-weighted aggregation (FedAlert-style)
+    """
+    global_model = LocalGenomeNet().to(DEVICE)
+    site_records = {s: load_site_records(s) for s in SITES}
+    history: List[float] = []
+
+    for rnd in range(1, rounds + 1):
+        local_params: List = []
+        weights: List[float] = []
+
+        for site in SITES:
+            local_model = LocalGenomeNet().to(DEVICE)
+            set_parameters(local_model, get_parameters(global_model))
+            loader = DataLoader(
+                VariantDataset(site_records[site]),
+                batch_size=BATCH_SIZE,
+                shuffle=True,
+            )
+            _, prec = train_local(local_model, loader, epochs=local_epochs)
+            local_params.append(get_parameters(local_model))
+            if strategy == "fedgenome":
+                weights.append(max(float(prec), 0.01))
+            else:
+                weights.append(float(len(site_records[site])))
+
+        aggregated = _weighted_average(local_params, weights)
+        set_parameters(global_model, aggregated)
+
+        per_site = evaluate_all_sites(global_model)
+        mean_auc = float(np.mean([v["auc"] for v in per_site.values()]))
+        history.append(mean_auc)
+        print(f"  round {rnd:2d}/{rounds}  mean AUC={mean_auc:.4f}")
+
+    per_site = evaluate_all_sites(global_model)
+    aucs = [v["auc"] for v in per_site.values()]
+    return {
+        "per_site": per_site,
+        "global_auc": round(float(np.mean(aucs)), 4),
+        "equity_gap": round(float(np.std(aucs)), 4),
+        "history": history,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", default="all", choices=["all", "fedavg", "fedgenome", "central"])
+    parser.add_argument(
+        "--strategy",
+        default="all",
+        choices=["all", "central", "fedavg", "fedgenome"],
+    )
     parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--local-epochs", type=int, default=2)
     args = parser.parse_args()
 
-    variants_path = DATA_DIR / "variants.json"
-    if not variants_path.exists():
+    if not (DATA_DIR / "variants.json").exists():
         raise FileNotFoundError("Run: python scripts/download_data.py && python prepare_data.py")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    summary = {}
+    summary: Dict = {}
 
-    print("Training centralized baseline …")
-    central_auc = train_centralized()
-    summary["centralized"] = {"global_auc": round(central_auc, 4)}
-    print(f"  Centralized AUC: {central_auc:.4f}")
+    if args.strategy in ("all", "central"):
+        print("Training centralized baseline …")
+        summary["centralized"] = run_centralized(epochs=args.rounds)
+        print(
+            f"  Centralized global AUC: {summary['centralized']['global_auc']:.4f}  "
+            f"equity_gap: {summary['centralized']['equity_gap']:.4f}"
+        )
 
-    for strat in (["fedavg", "fedgenome"] if args.strategy == "all" else [args.strategy]):
-        if strat == "central":
+    for strat in ["fedavg", "fedgenome"]:
+        if args.strategy not in ("all", strat):
             continue
         print(f"\nRunning FL: {strat} ({args.rounds} rounds) …")
-        site_results = {}
-        for site in ["site_1", "site_2", "site_3"]:
-            records = load_site_records(site)
-            model = LocalGenomeNet().to(DEVICE)
-            loader = DataLoader(VariantDataset(records), batch_size=64, shuffle=True)
-            if strat == "fedgenome":
-                # Simulate precision-weighted local training
-                train_local(model, loader, epochs=args.rounds)
-            else:
-                train_local(model, loader, epochs=args.rounds)
-            auc, prec = _evaluate(model, loader)
-            site_results[site] = {"auc": round(auc, 4), "precision": round(prec, 4)}
-        aucs = [v["auc"] for v in site_results.values()]
-        summary[strat] = {
-            "per_site": site_results,
-            "global_auc": round(sum(aucs) / len(aucs), 4),
-            "equity_gap": round(float(__import__("numpy").std(aucs)), 4),
-        }
-        print(f"  {strat} global AUC: {summary[strat]['global_auc']:.4f}  equity_gap: {summary[strat]['equity_gap']:.4f}")
+        summary[strat] = run_federated(strat, args.rounds, args.local_epochs)
+        print(
+            f"  {strat} global AUC: {summary[strat]['global_auc']:.4f}  "
+            f"equity_gap: {summary[strat]['equity_gap']:.4f}"
+        )
 
     out_path = RESULTS_DIR / "ablation.json"
-    with out_path.open("w") as fh:
+    with out_path.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"\nResults saved → {out_path}")
 
-    # Simple bar chart
     labels, aucs = [], []
-    for k, v in summary.items():
-        labels.append(k)
-        aucs.append(v.get("global_auc", 0))
+    for key, val in summary.items():
+        labels.append(key)
+        aucs.append(val.get("global_auc", 0.0))
     plt.figure(figsize=(6, 4))
-    plt.bar(labels, aucs, color=["#2e86c1", "#28b463", "#e74c3c"][:len(labels)])
+    plt.bar(labels, aucs, color=["#2e86c1", "#28b463", "#e74c3c"][: len(labels)])
     plt.ylabel("AUC-ROC")
     plt.title("FedGenome Ablation")
     plt.ylim(0, 1)
     plt.tight_layout()
-    plt.savefig(RESULTS_DIR / "ablation.png")
-    print(f"Plot saved → {RESULTS_DIR / 'ablation.png'}")
+    plot_path = RESULTS_DIR / "ablation.png"
+    plt.savefig(plot_path)
+    print(f"Plot saved → {plot_path}")
 
 
 if __name__ == "__main__":
