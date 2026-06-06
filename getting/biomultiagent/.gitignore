@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+venv/
+chroma_data/
+.env
+*.db

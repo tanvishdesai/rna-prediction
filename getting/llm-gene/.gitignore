@@ -1,0 +1,9 @@
+data/
+*.faiss
+*.npy
+*.json
+!gold_qa.json
+__pycache__/
+.venv/
+venv/
+.env

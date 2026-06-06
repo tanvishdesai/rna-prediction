@@ -57,5 +57,19 @@ checkpoint/
 *.wav
 *.mp3
 
+# Stanford RNA 3D Folding competition data (download from Kaggle)
 train_labels.v2.csv
 train_sequences.v2.csv
+train_labels.csv
+train_sequences.csv
+validation_labels.csv
+validation_sequences.csv
+test_sequences.csv
+sample_submission.csv
+submission.csv
+MSA/
+
+# Portfolio planning (tracked at root)
+# PLANNING.md and TASK.md are tracked; numbered copies are not
+PLANNING (*).md
+TASK (*).md
