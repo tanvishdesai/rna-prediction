@@ -73,3 +73,13 @@ MSA/
 # PLANNING.md and TASK.md are tracked; numbered copies are not
 PLANNING (*).md
 TASK (*).md
+
+# Three sub-projects — each is its own git repo; exclude from parent tracking
+llm-gene/
+biomultiagent/
+fedgenome/
+getting/
+
+# Kaggle local data files (download from Kaggle competition, do not commit)
+*.csv
+!sample_submission.csv
