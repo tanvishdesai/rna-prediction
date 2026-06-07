@@ -37,10 +37,18 @@ Quick start (local)
 
 Expected file layout (Stanford RNA 3D Folding competition)
 ----------------------------------------------------------
-  train_sequences.v2.csv     train_labels.v2.csv
+  train_sequences.v2.csv     train_labels.v2.csv   (labels: C1' x, y, z)
   validation_sequences.csv   validation_labels.csv
   test_sequences.csv
   MSA/   (*.fasta — evolutionary homolog alignments, one file per target)
+  MSA_v2/  (expanded MSAs — merged with MSA/, v2 wins on ID clash)
+  PDB_RNA/ (*.cif — PDB structures used for template-based modelling)
+
+Competition format notes
+------------------------
+  Training labels store ONE C1' coordinate triplet per residue (x, y, z).
+  Submission requires FIVE structure predictions per residue
+  (x_1,y_1,z_1 … x_5,y_5,z_5) — best-of-5 TM-score evaluation.
 """
 
 from __future__ import annotations
@@ -48,8 +56,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -104,7 +114,7 @@ def resolve_data_root() -> Path:
             return root
         log.warning("RNA_DATA_DIR='%s' not found — falling back to auto-detect.", env)
 
-    kaggle_slug = Path("/kaggle/input/stanford-rna-3d-folding")
+    kaggle_slug = Path("/kaggle/input/competitions/stanford-rna-3d-folding")
     if kaggle_slug.exists():
         log.info("Data root (Kaggle competition): %s", kaggle_slug)
         return kaggle_slug
@@ -138,7 +148,8 @@ class Config:
     val_seq      : str   = "validation_sequences.csv"
     val_lab      : str   = "validation_labels.csv"
     test_seq     : str   = "test_sequences.csv"
-    msa_dir      : str   = "MSA"
+    msa_dirs     : Tuple[str, ...] = ("MSA", "MSA_v2")
+    pdb_dir      : str   = "PDB_RNA"
     ckpt_path    : str   = field(default_factory=lambda: str(_out_dir() / "rnastruct_best.pt"))
     submission   : str   = field(default_factory=lambda: str(_out_dir() / "submission.csv"))
 
@@ -149,8 +160,9 @@ class Config:
 
     # ── data ──────────────────────────────────────────────────────────────────
     max_seq_len  : int   = 512   # pad / truncate all sequences to this length
-    n_atoms      : int   = 5     # backbone atoms per nucleotide residue
-    n_coords     : int   = 15    # n_atoms × 3  (x, y, z per atom)
+    n_coords     : int   = 3     # C1' atom (x, y, z) — competition label format
+    n_submit     : int   = 5     # structure slots in submission.csv (best-of-5)
+    tbm_min_sim  : float = 0.55  # min sequence identity for PDB template reuse
 
     # ── model ─────────────────────────────────────────────────────────────────
     d_model      : int   = 128   # transformer hidden dim; must be divisible by n_heads
@@ -211,10 +223,19 @@ class MSALibrary:
     _GAP_CHARS  = frozenset("-.")
     _NUC_TO_IDX : Dict[str, int] = {"A": 0, "C": 1, "G": 2, "U": 3}
 
-    def __init__(self, msa_dir: str, max_seq_len: int) -> None:
+    def __init__(self, msa_dirs: List[str], max_seq_len: int) -> None:
         self._L  = max_seq_len
         self._db : Dict[str, np.ndarray] = {}
-        self._build(Path(msa_dir))
+        found = False
+        for msa_dir in msa_dirs:
+            if Path(msa_dir).exists():
+                found = True
+                self._build(Path(msa_dir))
+        if not found:
+            log.warning(
+                "No MSA directories found (%s) – using uniform priors.",
+                ", ".join(msa_dirs),
+            )
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -294,6 +315,154 @@ class MSALibrary:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# §3b  PDB template library  (lightweight TBM — top solutions rely on this)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RNA_BASES = frozenset("ACGU")
+
+
+class PDBTemplateLibrary:
+    """
+    Index C1' coordinates from PDB_RNA/*.cif for template-based fallback.
+
+    Winners (e.g. 1st place team_cp) allocate submission slots to diverse
+    TBM templates before filling remaining slots with deep-learning models.
+    This lightweight indexer enables the same strategy without external tools.
+    """
+
+    _C1_NAMES = frozenset({"C1'", r"C1\'", "C1*"})
+
+    def __init__(self, pdb_dir: str, max_seq_len: int) -> None:
+        self._L   = max_seq_len
+        self._db  : Dict[str, np.ndarray] = {}   # sequence → (L, 3)
+        self._build(Path(pdb_dir))
+
+    def _build(self, d: Path) -> None:
+        if not d.exists():
+            log.info("PDB dir '%s' not found – TBM templates disabled.", d)
+            return
+        files = sorted(d.glob("*.cif"))
+        log.info("Indexing %d PDB mmCIF files for TBM …", len(files))
+        for fp in files:
+            for seq, coords in self._parse_cif(fp):
+                if len(seq) < 8:
+                    continue
+                key = seq.upper()
+                if key not in self._db or len(coords) > len(self._db[key]):
+                    self._db[key] = coords
+        log.info("  Cached %d PDB sequence templates.", len(self._db))
+
+    def _parse_cif(self, fp: Path) -> List[Tuple[str, np.ndarray]]:
+        try:
+            text = fp.read_text(errors="replace")
+        except Exception as exc:
+            log.debug("Could not read '%s': %s", fp.name, exc)
+            return []
+
+        # Locate the _atom_site loop and its column headers.
+        header_m = re.search(
+            r"loop_\s*\n(_atom_site\.\S+(?:\n_atom_site\.\S+)*)",
+            text,
+            re.MULTILINE,
+        )
+        if not header_m:
+            return []
+
+        cols = [ln.strip() for ln in header_m.group(1).splitlines()]
+        need = {"label_atom_id", "label_comp_id", "label_seq_id",
+                "Cartn_x", "Cartn_y", "Cartn_z"}
+        if not need.issubset(set(cols)):
+            return []
+
+        col_idx = {c: i for i, c in enumerate(cols)}
+        data_start = header_m.end()
+        lines = text[data_start:].splitlines()
+
+        # Per-chain residue → C1' coordinate
+        chains: Dict[str, Dict[int, Tuple[str, np.ndarray]]] = {}
+        n_cols = len(cols)
+
+        for raw in lines:
+            if raw.startswith("#") or raw.startswith("_"):
+                break
+            if raw.startswith("loop_"):
+                break
+            parts = raw.split()
+            if len(parts) < n_cols:
+                continue
+            atom = parts[col_idx["label_atom_id"]]
+            if atom not in self._C1_NAMES:
+                continue
+            base = parts[col_idx["label_comp_id"]].upper()
+            if len(base) != 1 or base not in _RNA_BASES:
+                continue
+            try:
+                resid = int(parts[col_idx["label_seq_id"]])
+                xyz   = np.array(
+                    [parts[col_idx["Cartn_x"]],
+                     parts[col_idx["Cartn_y"]],
+                     parts[col_idx["Cartn_z"]]],
+                    dtype=np.float32,
+                )
+            except (ValueError, IndexError):
+                continue
+            asym = (
+                parts[col_idx["auth_asym_id"]]
+                if "auth_asym_id" in col_idx else "A"
+            )
+            chains.setdefault(asym, {})[resid] = (base, xyz)
+
+        out: List[Tuple[str, np.ndarray]] = []
+        for residues in chains.values():
+            if not residues:
+                continue
+            ordered = [residues[r][0] for r in sorted(residues)]
+            coords  = np.stack(
+                [residues[r][1] for r in sorted(residues)], axis=0
+            )
+            seq = "".join(ordered)
+            L   = coords.shape[0]
+            if L >= self._L:
+                out.append((seq, coords[: self._L]))
+            else:
+                pad = np.zeros((self._L - L, 3), np.float32)
+                out.append((seq, np.vstack([coords, pad])))
+        return out
+
+    def best_templates(
+        self, query: str, n: int, min_sim: float
+    ) -> List[np.ndarray]:
+        """
+        Return up to *n* diverse template coordinate arrays for *query*,
+        ranked by sequence similarity (difflib ratio).
+        """
+        q = query.upper()[: self._L]
+        if not self._db:
+            return []
+
+        scored: List[Tuple[float, str]] = []
+        for seq, _ in self._db.items():
+            ratio = SequenceMatcher(None, q, seq[: len(q)]).ratio()
+            if ratio >= min_sim:
+                scored.append((ratio, seq))
+        scored.sort(reverse=True)
+
+        results: List[np.ndarray] = []
+        for _, seq in scored[: n * 3]:   # oversample, then deduplicate
+            if len(results) >= n:
+                break
+            tmpl = self._db[seq][: len(q)]
+            if len(tmpl) < len(q):
+                pad  = np.zeros((len(q) - len(tmpl), 3), np.float32)
+                tmpl = np.vstack([tmpl, pad])
+            # Skip near-duplicate templates (same geometry)
+            if results and np.allclose(tmpl, results[-1], atol=1.0):
+                continue
+            results.append(tmpl.astype(np.float32))
+        return results[:n]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # §4  Dataset
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -316,32 +485,65 @@ def _load_sequences(path: str) -> pd.DataFrame:
     return df
 
 
+def _detect_coord_columns(df: pd.DataFrame) -> List[str]:
+    """
+    Auto-detect coordinate columns in a label CSV.
+
+    Competition v2 labels:  x, y, z          (C1' training coordinates)
+    Submission / legacy:     x_1…x_5, y_1…z_5 (5 structure slots × xyz)
+    """
+    slot_cols = [f"{ax}_{i}" for i in range(1, 6) for ax in ("x", "y", "z")]
+    if all(c in df.columns for c in slot_cols):
+        return slot_cols
+    if all(c in df.columns for c in ("x", "y", "z")):
+        return ["x", "y", "z"]
+    raise ValueError(
+        f"Unrecognised coordinate columns in label file. "
+        f"Expected (x,y,z) or (x_1…z_5); got: {list(df.columns)}"
+    )
+
+
 def _load_labels(
     path: str, max_seq_len: int, n_coords: int
 ) -> Dict[str, np.ndarray]:
     """
     Parse label CSV.  ID column format:  "<target_id>_<resid>"
-    Coordinate columns: x_1 y_1 z_1  x_2 y_2 z_2  …  x_5 y_5 z_5
 
-    Returns  {target_id: (max_seq_len, 15) float32}.
+    Supports:
+      · C1' training format (x, y, z)           → (max_seq_len, 3)
+      · 5-slot submission format (x_1…z_5)      → uses slot 1 only for training
+
+    Returns  {target_id: (max_seq_len, n_coords) float32}.
     """
     df    = pd.read_csv(path)
     split = df["ID"].str.rsplit("_", n=1, expand=True)
     df["_tid"]   = split[0]
     df["_resid"] = pd.to_numeric(split[1], errors="coerce")
 
-    coord_cols = [f"{ax}_{i}" for i in range(1, 6) for ax in ("x", "y", "z")]
-    coord_cols = [c for c in coord_cols if c in df.columns]
-    if len(coord_cols) != n_coords:
-        raise ValueError(
-            f"Expected {n_coords} coordinate columns, found {len(coord_cols)} in '{path}'."
+    coord_cols = _detect_coord_columns(df)
+    if coord_cols == ["x", "y", "z"]:
+        if n_coords != 3:
+            log.warning(
+                "Label file '%s' has C1' (x,y,z) format; using 3 coords.",
+                Path(path).name,
+            )
+        use_cols = ["x", "y", "z"]
+    else:
+        # Submission-style columns — train on structure slot 1 (C1' of prediction 1)
+        use_cols = [f"{ax}_1" for ax in ("x", "y", "z")]
+        if not all(c in coord_cols for c in use_cols):
+            use_cols = coord_cols[:n_coords]
+        log.info(
+            "Label file '%s': using slot-1 coords %s for training.",
+            Path(path).name, use_cols,
         )
 
     out: Dict[str, np.ndarray] = {}
+    n_out = len(use_cols)
     for tid, grp in df.groupby("_tid"):
         grp  = grp.sort_values("_resid")
-        raw  = grp[coord_cols].values.astype(np.float32)   # (L, 15)
-        arr  = np.zeros((max_seq_len, n_coords), np.float32)
+        raw  = grp[use_cols].values.astype(np.float32)   # (L, n_out)
+        arr  = np.zeros((max_seq_len, n_out), np.float32)
         rows = min(len(raw), max_seq_len)
         arr[:rows] = raw[:rows]
         out[str(tid)] = arr
@@ -404,7 +606,7 @@ class RNADataset(Dataset):
         # Fit coordinate normalisation on this split; accept external for val/test
         if coord_mean is None:
             all_c           = np.stack([r["coords"] for r in self._records])
-            self.coord_mean = all_c.mean((0, 1))                # (15,)
+            self.coord_mean = all_c.mean((0, 1))                # (n_coords,)
             self.coord_std  = all_c.std((0, 1)).clip(min=1e-6)
         else:
             self.coord_mean = coord_mean
@@ -500,7 +702,7 @@ class TransformerBlock(nn.Module):
 
 class RNAStructFormer(nn.Module):
     """
-    MSA-augmented Transformer encoder for per-residue 3D backbone regression.
+    MSA-augmented Transformer encoder for per-residue C1' coordinate regression.
 
     Input representation (per residue, fused before positional encoding):
       · Learned nucleotide embedding  (B, L) int64  → (B, L, d_model)
@@ -511,9 +713,8 @@ class RNAStructFormer(nn.Module):
       n_layers stacked TransformerBlocks with pre-LN and GELU feed-forward.
 
     Output head:
-      LayerNorm → Linear(d, d) → GELU → Linear(d, 15)
-      Produces (B, L, 15) coordinate predictions per residue.
-      15 = 5 backbone atoms × (x, y, z).
+      LayerNorm → Linear(d, d) → GELU → Linear(d, 3)
+      Produces (B, L, 3) C1' (x, y, z) predictions per residue.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -557,7 +758,7 @@ class RNAStructFormer(nn.Module):
         tokens:   torch.Tensor,    # (B, L) int64
         profile:  torch.Tensor,    # (B, L, 5) float32
         pad_mask: torch.Tensor,    # (B, L) bool  — True = ignore (padding)
-    ) -> torch.Tensor:             # → (B, L, 15)
+    ) -> torch.Tensor:             # → (B, L, 3)
         x = self.tok_emb(tokens) + self.msa_proj(profile)
         x = self.pos_enc(self.in_norm(x))
         for block in self.encoder:
@@ -570,43 +771,38 @@ class RNAStructFormer(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def coord_loss(
-    pred:   torch.Tensor,   # (B, L, 15)
-    target: torch.Tensor,   # (B, L, 15)
+    pred:   torch.Tensor,   # (B, L, 3)
+    target: torch.Tensor,   # (B, L, 3)
     mask:   torch.Tensor,   # (B, L) bool — True = padding
 ) -> torch.Tensor:
-    """Masked MSE over all 15 coordinates, ignoring padding positions."""
+    """Masked MSE over C1' (x, y, z), ignoring padding positions."""
     per_res = F.mse_loss(pred, target, reduction="none").mean(-1)   # (B, L)
     valid   = ~mask
     return (per_res * valid).sum() / valid.sum().clamp(min=1)
 
 
 def distance_matrix_loss(
-    pred:    torch.Tensor,   # (B, L, 15)
-    target:  torch.Tensor,   # (B, L, 15)
+    pred:    torch.Tensor,   # (B, L, 3)
+    target:  torch.Tensor,   # (B, L, 3)
     mask:    torch.Tensor,   # (B, L) bool
     max_pos: int = 128,      # subsample positions to bound memory
 ) -> torch.Tensor:
     """
-    Inter-residue C3′ distance matrix consistency loss.
+    Inter-residue C1' distance matrix consistency loss.
 
-    Why this matters: raw coordinate MSE is not rotation-invariant — two
-    structurally identical predictions that differ by a global rotation
-    produce different coordinate losses.  This term measures whether the
-    PAIRWISE DISTANCES between residues are preserved, which is invariant
-    to any rigid-body rotation or translation.
-
-    C3′ is backbone atom index 1 (0-based) → columns 3, 4, 5 of the
-    15-coordinate vector (x_2, y_2, z_2 in 1-indexed naming).
+    Raw coordinate MSE is not rotation-invariant.  Pairwise C1' distances
+    are preserved under rigid-body motion, giving a rotation-invariant
+    training signal aligned with the competition's TM-score metric.
 
     max_pos subsamples positions to keep the (B, S, S) distance matrix
     within comfortable memory bounds during training.
     """
-    p_c3 = pred[..., 3:6]      # (B, L, 3)  predicted  C3′
-    t_c3 = target[..., 3:6]    # (B, L, 3)  true       C3′
+    p_pos = pred               # (B, L, 3)  predicted C1'
+    t_pos = target             # (B, L, 3)  true C1'
 
     valid = (~mask).float().unsqueeze(-1)   # (B, L, 1)
-    p_c3  = p_c3 * valid
-    t_c3  = t_c3 * valid
+    p_c3  = p_pos * valid
+    t_c3  = t_pos * valid
 
     # Subsample positions to avoid O(L²) memory blow-up
     L = p_c3.size(1)
@@ -642,12 +838,12 @@ def total_loss(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def per_sample_rmsd(
-    pred_dn: np.ndarray,   # (L, 15) denormalised
-    true_dn: np.ndarray,   # (L, 15) denormalised
+    pred_dn: np.ndarray,   # (L, 3) denormalised C1'
+    true_dn: np.ndarray,   # (L, 3) denormalised C1'
     valid:   np.ndarray,   # (L,) bool — True = non-padding
 ) -> float:
-    p = pred_dn[valid].reshape(-1, 5, 3)   # (n_valid, 5 atoms, xyz)
-    t = true_dn[valid].reshape(-1, 5, 3)
+    p = pred_dn[valid]   # (n_valid, 3)
+    t = true_dn[valid]
     return float(np.sqrt(((p - t) ** 2).sum(-1).mean()))
 
 
@@ -791,12 +987,21 @@ def fit(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def predict_and_save(
-    model:   nn.Module,
-    test_ds: RNADataset,
-    cfg:     Config,
-    mean:    np.ndarray,
-    std:     np.ndarray,
+    model:    nn.Module,
+    test_ds:  RNADataset,
+    cfg:      Config,
+    mean:     np.ndarray,
+    std:      np.ndarray,
+    pdb_lib:  Optional[PDBTemplateLibrary] = None,
 ) -> None:
+    """
+    Write submission.csv with cfg.n_submit structure slots per residue.
+
+    Slot filling strategy (mirrors top competition pipelines):
+      1. PDB templates (diverse TBM candidates) when available
+      2. Model prediction for remaining slots
+      3. Duplicate model prediction if fewer than n_submit sources exist
+    """
     model.eval()
     loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0
@@ -809,22 +1014,44 @@ def predict_and_save(
             )
             chunks.append(out.cpu().numpy())
 
-    preds    = np.concatenate(chunks, 0)                          # (N, L, 15)
+    preds    = np.concatenate(chunks, 0)                          # (N, L, 3)
     preds_dn = preds * std[np.newaxis, np.newaxis] + mean[np.newaxis, np.newaxis]
 
-    c_names  = [f"{ax}_{i}" for i in range(1, 6) for ax in ("x", "y", "z")]
+    c_names  = [f"{ax}_{i}" for i in range(1, cfg.n_submit + 1) for ax in ("x", "y", "z")]
     rows: List[Dict] = []
+    n_tbm_used = 0
+
     for i, (tid, seq) in enumerate(zip(test_ds.target_ids(), test_ds.sequences())):
         L = min(len(seq), cfg.max_seq_len)
+        model_coords = preds_dn[i, :L]                            # (L, 3)
+
+        # Collect up to n_submit diverse structure candidates
+        slots: List[np.ndarray] = []
+        if pdb_lib is not None:
+            tbm = pdb_lib.best_templates(seq, cfg.n_submit, cfg.tbm_min_sim)
+            if tbm:
+                n_tbm_used += 1
+            slots.extend(tbm)
+        slots.append(model_coords)
+        while len(slots) < cfg.n_submit:
+            slots.append(model_coords.copy())
+        slots = slots[: cfg.n_submit]
+
         for r in range(L):
             row = {"ID": f"{tid}_{r + 1}", "resname": seq[r], "resid": r + 1}
-            row.update(zip(c_names, preds_dn[i, r].tolist()))
+            flat = []
+            for slot in slots:
+                flat.extend(slot[r].tolist())
+            row.update(zip(c_names, flat))
             rows.append(row)
 
     pd.DataFrame(rows, columns=["ID", "resname", "resid"] + c_names).to_csv(
         cfg.submission, index=False
     )
-    log.info("Submission written → %s  (%d rows)", cfg.submission, len(rows))
+    log.info(
+        "Submission written → %s  (%d rows, %d/%d targets used TBM templates)",
+        cfg.submission, len(rows), n_tbm_used, len(test_ds),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -853,17 +1080,24 @@ def main() -> None:
     CFG.val_seq   = CFG.path(CFG.val_seq)
     CFG.val_lab   = CFG.path(CFG.val_lab)
     CFG.test_seq  = CFG.path(CFG.test_seq)
-    msa_dir       = CFG.path(CFG.msa_dir)
+    msa_dirs      = [CFG.path(d) for d in CFG.msa_dirs if Path(CFG.path(d)).exists()]
+    if not msa_dirs:
+        msa_dirs = [CFG.path(CFG.msa_dirs[0])]   # trigger uniform-prior warning
+    pdb_dir       = CFG.path(CFG.pdb_dir)
 
     log.info("Data root : %s", CFG.data_root)
     log.info("Train     : %s + %s", CFG.train_seq, CFG.train_lab)
     log.info("Val       : %s + %s", CFG.val_seq,   CFG.val_lab)
+    log.info("MSA dirs  : %s", msa_dirs)
+    log.info("PDB dir   : %s", pdb_dir)
     log.info("Outputs   : %s, %s", CFG.ckpt_path, CFG.submission)
-    log.info("Model     : d=%d  heads=%d  layers=%d  max_L=%d  device=%s",
-             CFG.d_model, CFG.n_heads, CFG.n_layers, CFG.max_seq_len, CFG.device)
+    log.info("Model     : d=%d  heads=%d  layers=%d  max_L=%d  coords=%d  device=%s",
+             CFG.d_model, CFG.n_heads, CFG.n_layers, CFG.max_seq_len,
+             CFG.n_coords, CFG.device)
 
-    # MSA library
-    msa = MSALibrary(msa_dir, CFG.max_seq_len)
+    # MSA library (MSA + MSA_v2 merged)
+    msa = MSALibrary(msa_dirs, CFG.max_seq_len)
+    pdb = PDBTemplateLibrary(pdb_dir, CFG.max_seq_len)
 
     # Datasets
     tr_ds = RNADataset(CFG.train_seq, CFG.train_lab, msa, CFG)
@@ -898,7 +1132,9 @@ def main() -> None:
             coord_mean=tr_ds.coord_mean,
             coord_std =tr_ds.coord_std,
         )
-        predict_and_save(model, ts_ds, CFG, tr_ds.coord_mean, tr_ds.coord_std)
+        predict_and_save(
+            model, ts_ds, CFG, tr_ds.coord_mean, tr_ds.coord_std, pdb_lib=pdb
+        )
     else:
         log.warning("Test file '%s' not found — skipping inference.", CFG.test_seq)
 
