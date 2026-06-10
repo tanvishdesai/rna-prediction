@@ -411,9 +411,11 @@ class MSALibrary:
                 self._db[key] = profile
         log.info("  Cached %d MSA profiles.", len(self._db))
 
-    def _fasta_to_profile(self, fp: Path) -> Optional[np.ndarray]:
-        seqs: List[str] = []
-        buf:  List[str] = []
+    def _read_fasta_records(self, fp: Path) -> List[Tuple[str, str]]:
+        """Return (header, sequence) pairs from a FASTA file."""
+        records: List[Tuple[str, str]] = []
+        header = ""
+        buf: List[str] = []
         try:
             with fp.open() as fh:
                 for raw in fh:
@@ -422,52 +424,79 @@ class MSALibrary:
                         continue
                     if line.startswith(">"):
                         if buf:
-                            seqs.append("".join(buf).upper())
+                            records.append((header, "".join(buf).upper()))
                             buf = []
+                        header = line[1:].strip()
                     else:
                         buf.append(line)
                 if buf:
-                    seqs.append("".join(buf).upper())
+                    records.append((header, "".join(buf).upper()))
         except Exception as exc:
-            log.debug("Could not read '%s': %s", fp.name, exc)
+            log.warning("Could not read '%s': %s", fp.name, exc)
+            return []
+        return records
+
+    def _fasta_to_profile(self, fp: Path) -> Optional[np.ndarray]:
+        records = self._read_fasta_records(fp)
+        if not records:
             return None
 
-        if not seqs:
-            return None
+        seqs = [seq for _, seq in records]
+        aln_len = max(len(seq) for seq in seqs)
+        seqs = [seq.ljust(aln_len, "-") for seq in seqs]
 
-        aln_len = len(seqs[0])
-        counts  = np.zeros((aln_len, 5), np.float32)   # A C G U gap
+        # Identify the query row (competition MSAs label it >query)
+        query_idx = 0
+        for i, (hdr, _) in enumerate(records):
+            if "query" in hdr.lower():
+                query_idx = i
+                break
+        query_aln = seqs[query_idx]
 
+        counts = np.zeros((aln_len, 5), np.float32)   # A C G U gap
+        used   = 0
         for seq in seqs:
             if len(seq) != aln_len:
-                continue                                 # skip malformed rows
+                continue
+            used += 1
             for pos, ch in enumerate(seq):
                 if ch in self._GAP_CHARS:
                     counts[pos, 4] += 1.0
                 elif ch in self._NUC_TO_IDX:
                     counts[pos, self._NUC_TO_IDX[ch]] += 1.0
 
-        row_sums = counts.sum(1, keepdims=True).clip(min=1.0)
-        profile  = counts / row_sums        # row-wise relative frequencies (A C G U gap)
+        if used == 0:
+            return None
 
-        # Shannon entropy + effective depth (columns 5–6)
+        row_sums = counts.sum(1, keepdims=True).clip(min=1.0)
+        profile  = counts / row_sums
+
         entropy = -(profile * np.log(profile + 1e-8)).sum(1, keepdims=True)
-        depth   = np.full((aln_len, 1), float(len(seqs)), np.float32)
-        depth  /= max(len(seqs), 1.0)
+        depth   = np.full((aln_len, 1), float(used), np.float32)
+        depth  /= max(used, 1.0)
         profile = np.hstack([profile, entropy.astype(np.float32), depth])
 
-        # Align length to max_seq_len
-        L = profile.shape[0]
-        if L >= self._L:
-            return profile[: self._L]
-        pad = np.zeros((self._L - L, MSA_DIM), np.float32)
-        pad[:, :5] = 0.2
-        return np.vstack([profile, pad])
+        # Map alignment columns → ungapped query residue indices
+        mapped: List[np.ndarray] = []
+        for col, qch in enumerate(query_aln):
+            if qch in self._GAP_CHARS or qch not in self._NUC_TO_IDX:
+                continue
+            mapped.append(profile[col])
+
+        if not mapped:
+            return None
+
+        mapped_arr = np.stack(mapped, axis=0)
+        n_res      = mapped_arr.shape[0]
+        if n_res >= self._L:
+            return mapped_arr[: self._L]
+        pad = np.zeros((self._L - n_res, MSA_DIM), np.float32)
+        return np.vstack([mapped_arr, pad])
 
     # ── public ────────────────────────────────────────────────────────────────
 
     def get(self, target_id: str) -> np.ndarray:
-        """Return (max_seq_len, 5) profile; uniform prior if not found."""
+        """Return (max_seq_len, MSA_DIM) profile aligned to query residues."""
         key = target_id.upper()
         if key in self._db:
             return self._db[key]
@@ -475,9 +504,8 @@ class MSALibrary:
         for k in self._db:
             if k.startswith(key) or key.startswith(k):
                 return self._db[k]
-        out = np.zeros((self._L, MSA_DIM), np.float32)
-        out[:, :5] = 0.2
-        return out
+        log.debug("No MSA profile for '%s' — using zero prior.", target_id)
+        return np.zeros((self._L, MSA_DIM), np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -682,17 +710,20 @@ def _detect_coord_columns(df: pd.DataFrame) -> List[str]:
     """
     Auto-detect coordinate columns in a label CSV.
 
-    Competition v2 labels:  x, y, z          (C1' training coordinates)
-    Submission / legacy:     x_1…x_5, y_1…z_5 (5 structure slots × xyz)
+    Competition v2 labels:  x, y, z  or  x_1, y_1, z_1   (C1' training coordinates)
+    Submission / legacy:     x_1…x_5, y_1…z_5              (5 structure slots × xyz)
     """
     slot_cols = [f"{ax}_{i}" for i in range(1, 6) for ax in ("x", "y", "z")]
     if all(c in df.columns for c in slot_cols):
         return slot_cols
+    slot1_cols = [f"{ax}_1" for ax in ("x", "y", "z")]
+    if all(c in df.columns for c in slot1_cols):
+        return slot1_cols
     if all(c in df.columns for c in ("x", "y", "z")):
         return ["x", "y", "z"]
     raise ValueError(
         f"Unrecognised coordinate columns in label file. "
-        f"Expected (x,y,z) or (x_1…z_5); got: {list(df.columns)}"
+        f"Expected (x,y,z), (x_1,y_1,z_1), or (x_1…z_5); got: {list(df.columns)}"
     )
 
 
@@ -797,11 +828,16 @@ class RNADataset(Dataset):
             log.warning("  Skipped %d sequences with no matching labels.", skipped)
         log.info("  %d samples ready.", len(self._records))
 
-        # Fit coordinate normalisation on this split; accept external for val/test
+        # Fit coordinate normalisation on valid (non-padded) residues only
         if coord_mean is None:
-            all_c           = np.stack([r["coords"] for r in self._records])
-            self.coord_mean = all_c.mean((0, 1))                # (n_coords,)
-            self.coord_std  = all_c.std((0, 1)).clip(min=1e-6)
+            valid_coords = []
+            for r in self._records:
+                n_res = min(len(r["seq"]), cfg.max_seq_len)
+                if n_res > 0:
+                    valid_coords.append(r["coords"][:n_res])
+            all_c           = np.concatenate(valid_coords, axis=0)
+            self.coord_mean = all_c.mean(0)                       # (n_coords,)
+            self.coord_std  = all_c.std(0).clip(min=1e-6)
         else:
             self.coord_mean = coord_mean
             self.coord_std  = (
@@ -1071,10 +1107,29 @@ def per_sample_rmsd(
     pred_dn: np.ndarray,   # (L, 3) denormalised C1'
     true_dn: np.ndarray,   # (L, 3) denormalised C1'
     valid:   np.ndarray,   # (L,) bool — True = non-padding
+    align:   bool = True,
 ) -> float:
     p = pred_dn[valid]   # (n_valid, 3)
     t = true_dn[valid]
+    if len(p) == 0:
+        return float("inf")
+    if align and len(p) >= 3:
+        p = kabsch_align(p, t)
     return float(np.sqrt(((p - t) ** 2).sum(-1).mean()))
+
+
+def baseline_mean_coord_rmsd(loader: DataLoader, mean: np.ndarray, std: np.ndarray) -> float:
+    """Naive baseline: predict the training-set mean coordinate for every residue."""
+    scores: List[float] = []
+    mean_dn = mean.astype(np.float32)
+    for _, _, coords, mask, _ in loader:
+        true = coords.numpy()
+        vm   = ~mask.numpy()
+        for b in range(true.shape[0]):
+            td   = true[b] * std + mean
+            pred = np.broadcast_to(mean_dn, td.shape)
+            scores.append(per_sample_rmsd(pred, td, vm[b]))
+    return float(np.mean(scores)) if scores else float("inf")
 
 
 @torch.no_grad()
@@ -1453,6 +1508,9 @@ def main() -> None:
     pin       = (CFG.device == "cuda")
     tr_loader = DataLoader(tr_ds, CFG.batch_size, shuffle=True,  num_workers=0, pin_memory=pin)
     vl_loader = DataLoader(vl_ds, CFG.batch_size, shuffle=False, num_workers=0, pin_memory=pin)
+
+    baseline = baseline_mean_coord_rmsd(vl_loader, tr_ds.coord_mean, tr_ds.coord_std)
+    log.info("Naive mean-coordinate baseline RMSD: %.3f Å", baseline)
 
     # Model
     model = RNAStructFormer(CFG).to(CFG.device)

@@ -3,8 +3,8 @@
 > **Part of the Bioinformatics AI Portfolio** — Project 0 of 4.
 > See [PLANNING.md](PLANNING.md) for the full portfolio roadmap.
 
-Predicts 3D atomic coordinates for 5 backbone atoms per nucleotide
-(P, C4′, C3′, O3′, C1′) from RNA sequences using a MSA-augmented Transformer encoder.
+Predicts per-residue C1′ 3D coordinates from RNA sequences using a MSA-augmented
+Pre-LN Transformer encoder (Stanford RNA 3D Folding competition format).
 
 ---
 
@@ -12,15 +12,14 @@ Predicts 3D atomic coordinates for 5 backbone atoms per nucleotide
 
 ```
 Input per residue
-  Nucleotide token embedding   (d_model = 128)
-  + MSA profile projection     (5 → d_model)
+  Nucleotide token embedding   (d_model = 192)
+  + MSA profile projection     (7 → d_model: A/C/G/U/gap + entropy + depth)
   → LayerNorm + sinusoidal positional encoding
-  → 4× Pre-LN Transformer Encoder
-       Multi-head self-attention (8 heads, GELU FFN, d_ff = 512)
-  → LayerNorm → MLP head → (B, L, 15) coordinates
+  → 6× Pre-LN Transformer Encoder (8 heads, GELU FFN, d_ff = 768)
+  → LayerNorm → MLP head → (B, L, 3) C1′ coordinates
 ```
 
-**Loss**: `L = L_coord(MSE on 15 coords) + 0.25 × L_dist(C3′ pairwise distance matrix)`
+**Loss**: `L = L_coord(MSE on C1′) + 0.30 × L_dist(C1′ pairwise distance matrix, rotation-invariant)`
 
 The distance term is rotation- and translation-invariant, addressing the key failure mode of raw coordinate regression.
 
